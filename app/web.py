@@ -14,11 +14,12 @@ import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 
+import requests
 from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 from app import config
-from app.cli import process
+from app.cli import process, process_apify
 from app.db import Database, utcnow
 from app.io_excel import export_report, read_records
 from app.logging_setup import setup_logging
@@ -52,7 +53,7 @@ class Worker:
         self.state = {"running": False, "batch_id": None, "started_at": None,
                       "processed": 0, "message": "Idle"}
 
-    def start(self, batch_id, limit=None, use_socialcrawl=False):
+    def start(self, batch_id, limit=None, source="free"):
         with self.lock:
             if self.thread and self.thread.is_alive():
                 return False
@@ -63,15 +64,18 @@ class Worker:
             self.state = {"running": True, "batch_id": batch_id,
                           "started_at": utcnow().isoformat(), "processed": 0,
                           "message": "Running..."}
-            self.thread = threading.Thread(target=self._run, args=(batch_id, limit, use_socialcrawl),
+            self.thread = threading.Thread(target=self._run, args=(batch_id, limit, source),
                                            daemon=True)
             self.thread.start()
             return True
 
-    def _run(self, batch_id, limit, use_socialcrawl):
+    def _run(self, batch_id, limit, source):
         try:
-            result = process(db, limit=limit, batch_id=batch_id, stop_event=self.stop_event,
-                             use_socialcrawl=use_socialcrawl)
+            if source == "apify":
+                result = process_apify(db, limit=limit, batch_id=batch_id, stop_event=self.stop_event)
+            else:
+                result = process(db, limit=limit, batch_id=batch_id, stop_event=self.stop_event,
+                                 use_socialcrawl=source == "socialcrawl")
             self.state.update(processed=result["processed"], message=result["reason"])
         except Exception as exc:  # surface in the UI instead of dying silently
             log.exception("Worker crashed")
@@ -173,7 +177,14 @@ def start(batch_id):
     body = request.get_json(silent=True) or {}
     limit = body.get("limit")
     limit = int(limit) if limit not in (None, "", 0, "0") else None
-    if not worker.start(batch_id, limit, use_socialcrawl=bool(body.get("use_socialcrawl"))):
+    source = body.get("source") or "free"
+    if source not in ("free", "apify", "socialcrawl"):
+        return jsonify(error="Unknown source"), 400
+    if source == "apify" and not config.APIFY_API_TOKEN:
+        return jsonify(error="APIFY_API_TOKEN is not set in .env"), 400
+    if source == "socialcrawl" and not config.SOCIALCRAWL_API_KEY:
+        return jsonify(error="SOCIALCRAWL_API_KEY is not set in .env"), 400
+    if not worker.start(batch_id, limit, source=source):
         return jsonify(error="A run is already in progress. Stop it first."), 409
     return jsonify(worker.state)
 
@@ -192,6 +203,17 @@ def retry_failed(batch_id):
             {"task_status": "completed", "verification_status": "needs_review"},
             {"task_status": "completed", "current_job_title": None},
         ]},
+        {"$set": {"task_status": "pending", "attempts": 0, "updated_at": utcnow()}})
+    return jsonify(requeued=res.modified_count)
+
+
+@app.post("/api/batches/<batch_id>/requeue-no-dates")
+def requeue_no_dates(batch_id):
+    """Put finished rows that have no start date back in the queue, so a
+    run with Apify / SocialCrawl can fill them. Rows filled by hand are kept."""
+    res = db.output.update_many(
+        {"batch_ids": batch_id, "task_status": "completed", "employment_dates": None,
+         "source": {"$ne": "manual_paste"}},
         {"$set": {"task_status": "pending", "attempts": 0, "updated_at": utcnow()}})
     return jsonify(requeued=res.modified_count)
 
@@ -224,7 +246,18 @@ def _socialcrawl_credits():
 
 @app.get("/api/socialcrawl")
 def socialcrawl_info():
-    return jsonify(enabled=bool(config.SOCIALCRAWL_API_KEY), credits_remaining=_socialcrawl_credits())
+    apify_usage = apify_limit = None
+    if config.APIFY_API_TOKEN:
+        try:
+            lim = requests.get("https://api.apify.com/v2/users/me/limits",
+                               params={"token": config.APIFY_API_TOKEN}, timeout=10).json().get("data", {})
+            apify_usage = (lim.get("current") or {}).get("monthlyUsageUsd")
+            apify_limit = (lim.get("limits") or {}).get("maxMonthlyUsageUsd")
+        except Exception:
+            pass
+    return jsonify(enabled=bool(config.SOCIALCRAWL_API_KEY), credits_remaining=_socialcrawl_credits(),
+                   apify_enabled=bool(config.APIFY_API_TOKEN),
+                   apify_usage_usd=apify_usage, apify_limit_usd=apify_limit)
 
 
 @app.post("/api/records/socialcrawl")

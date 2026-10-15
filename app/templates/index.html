@@ -91,11 +91,17 @@
       <h2 style="margin:0">2. Run</h2>
       <select id="batch" class="grow" style="max-width:480px"></select>
       <label class="note">Limit <input id="limit" type="number" min="0" placeholder="all"></label>
-      <label class="note" id="scWrap" hidden title="Gets type, start date, duration and work mode. 5 credits per profile.">
-        <input id="useSc" type="checkbox"> Use SocialCrawl (dates) · <span id="scCredits">?</span> credits left</label>
+      <label class="note">Source
+        <select id="source">
+          <option value="free">Free: ChocoData + Google (title, company)</option>
+          <option value="apify" disabled>Apify: title, company, start year (~$0.006/profile)</option>
+          <option value="socialcrawl" disabled>SocialCrawl: full dates, type, work mode (5 credits/profile)</option>
+        </select></label>
+      <span class="note" id="srcInfo"></span>
       <button id="start" class="primary">Start scraping</button>
       <button id="stop" class="danger" disabled>Stop</button>
       <button id="retry" title="Put failed and incomplete (needs review) records back in the queue">Re-check failed</button>
+      <button id="noDates" title="Put finished rows that have no start date back in the queue, to run them with Apify or SocialCrawl">Re-check rows without dates</button>
       <button id="export">Download Excel</button>
     </div>
     <div class="stats" id="stats"></div>
@@ -200,7 +206,7 @@ $("#start").onclick = async () => {
   if (!state.batch) return msg("Upload a file first.", true);
   try {
     await api(`/api/batches/${state.batch}/start`, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ limit: $("#limit").value || null, use_socialcrawl: $("#useSc").checked }) });
+      body: JSON.stringify({ limit: $("#limit").value || null, source: $("#source").value }) });
     msg("Running…"); refresh();
   } catch (e) { msg(e.message, true); }
 };
@@ -210,7 +216,12 @@ $("#retry").onclick = async () => {
   const r = await api(`/api/batches/${state.batch}/retry-failed`, { method: "POST" });
   msg(`${r.requeued} records put back in the queue. Press "Start scraping".`); refresh();
 };
-$("#export").onclick = () => state.batch && (location.href = `/api/batches/${state.batch}/export`);
+$("#noDates").onclick = async () => {
+  if (!state.batch) return;
+  const r = await api(`/api/batches/${state.batch}/requeue-no-dates`, { method: "POST" });
+  msg(`${r.requeued} rows without dates put back in the queue. Choose Apify or SocialCrawl as Source, set a Limit, and press "Start scraping".`); refresh();
+};
+$("#export").onclick =() => state.batch && (location.href = `/api/batches/${state.batch}/export`);
 $("#prev").onclick = () => { if (state.page > 1) { state.page--; refresh(); } };
 $("#next").onclick = () => { state.page++; refresh(); };
 
@@ -300,8 +311,12 @@ async function loadSc() {
   try {
     const r = await api("/api/socialcrawl");
     sc.enabled = r.enabled; sc.credits = r.credits_remaining;
-    $("#scWrap").hidden = !r.enabled;
-    $("#scCredits").textContent = r.credits_remaining ?? "?";
+    $("#source option[value=apify]").disabled = !r.apify_enabled;
+    $("#source option[value=socialcrawl]").disabled = !r.enabled;
+    const parts = [];
+    if (r.apify_enabled) parts.push(`Apify: $${(r.apify_usage_usd ?? 0).toFixed(3)} of $${r.apify_limit_usd ?? 5} used this month`);
+    if (r.enabled) parts.push(`SocialCrawl: ${r.credits_remaining ?? "?"} credits left`);
+    $("#srcInfo").textContent = parts.join(" · ");
   } catch (e) { /* optional feature */ }
 }
 async function fetchDates(btn, url) {

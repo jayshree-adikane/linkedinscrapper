@@ -100,6 +100,51 @@ def process(db, limit=None, batch_id=None, stop_event=None, use_socialcrawl=Fals
     return {"processed": processed, "reason": reason}
 
 
+def process_apify(db, limit=None, batch_id=None, stop_event=None):
+    """Like process(), but sends APIFY_BATCH_SIZE profiles per Apify run
+    (each run has a start fee, so batching keeps the cost per profile low)."""
+    from app.provider import apify_fetch_many, from_apify
+    processed = 0
+    reason = "Queue empty: all records processed"
+    while limit is None or processed < limit:
+        if stop_event is not None and stop_event.is_set():
+            reason = "Stopped by user"
+            break
+        size = config.APIFY_BATCH_SIZE if limit is None else min(config.APIFY_BATCH_SIZE, limit - processed)
+        claimed = []
+        for _ in range(size):
+            rec = db.claim_one(batch_id)
+            if not rec:
+                break
+            claimed.append(rec)
+        if not claimed:
+            break
+        urls = [r.get("linkedin_url") for r in claimed]
+        try:
+            results = apify_fetch_many(urls)
+        except ProviderError as exc:
+            for rec in claimed:
+                db.fail(rec, exc.status, str(exc), retry=exc.retryable)
+            log.error("Apify run failed for %d records: %s", len(claimed), exc)
+            reason = f"Stopped: {exc}"[:500]
+            break
+        for rec in claimed:
+            try:
+                fields = from_apify(results.get(rec.get("linkedin_url")), rec)
+                db.finish(rec.get("prospect_id"), rec.get("linkedin_url"), fields)
+            except ProviderError as exc:
+                db.fail(rec, exc.status, str(exc), retry=False)
+            processed += 1
+        log.info("Apify run: %d profiles (%d total this run)", len(claimed), processed)
+        if _pause(config.REQUEST_DELAY_SECONDS, stop_event):
+            reason = "Stopped by user"
+            break
+    else:
+        reason = f"Reached limit of {limit} records"
+    log.info("Apify processing finished. Processed this run: %d (%s)", processed, reason)
+    return {"processed": processed, "reason": reason}
+
+
 def status(db):
     """Print queue counts."""
     print("total", db.output.count_documents({}))

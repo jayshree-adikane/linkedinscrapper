@@ -121,7 +121,8 @@ def employment_dates(exp):
     end = _to_ym(end_raw)
     is_present = end is None or bool(exp.get("is_current") or exp.get("current"))
     end_ym = today if is_present else end
-    dur = _duration_text(start, end_ym)
+    # Year-only start ('2025') would give a made-up month count: leave duration out.
+    dur = _duration_text(start, end_ym) if start[1] else None
     label = f"{_label(start)} - {'Present' if is_present else _label(end)}"
     return f"{label} · {dur}" if dur else label
 
@@ -465,6 +466,66 @@ def lookup_socialcrawl(record):
         fields.pop("location", None)
     fields["source"] = "socialcrawl"
     fields["credits_remaining"] = payload.get("credits_remaining")
+    return fields
+
+
+# --------------------------------------------------------------------------
+# Apify actor anchor/linkedin-profile-enrichment. Public profile data with
+# experiences [{title, company, starts_at: '2025', ends_at}]: dates are often
+# year-only and there is no employment type / work mode. Many URLs per run.
+# --------------------------------------------------------------------------
+def apify_fetch_many(urls):
+    """Return {url: item-or-None} for a list of profile URLs (one actor run)."""
+    if not config.APIFY_API_TOKEN:
+        raise ProviderError("APIFY_API_TOKEN is not set", retryable=False, status="restricted")
+    try:
+        resp = requests.post(
+            f"https://api.apify.com/v2/acts/{config.APIFY_ACTOR}/run-sync-get-dataset-items",
+            params={"token": config.APIFY_API_TOKEN, "timeout": 290},
+            json={"startUrls": [{"url": u, "id": str(i)} for i, u in enumerate(urls)]},
+            timeout=310,
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise ProviderError(f"Apify network error: {exc}", retryable=True)
+    code = resp.status_code
+    body = resp.text[:300]
+    if code in (401, 402, 403):
+        raise ProviderError(f"Apify auth/credit error {code}: {body}", retryable=False, status="restricted")
+    if code == 429:
+        raise ProviderError(f"Apify rate limit (429): {body}", retryable=True)
+    if code == 408:
+        raise ProviderError(f"Apify run timed out: {body}", retryable=True)
+    if code >= 400:
+        raise ProviderError(f"Apify error {code}: {body}", retryable=code >= 500)
+    try:
+        items = resp.json()
+    except ValueError:
+        raise ProviderError("Apify returned invalid JSON", retryable=True)
+    out = {u: None for u in urls}
+    for it in items if isinstance(items, list) else []:
+        try:
+            out[urls[int(it.get("id"))]] = it
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def from_apify(item, record):
+    if not item or not (item.get("experiences") or item.get("full_name")):
+        raise ProviderError("Apify: no public data for this profile", retryable=False, status="needs_review")
+    fields = _from_chocodata({"experience": item.get("experiences") or []}, record)
+    place = ", ".join(p for p in (item.get("city"), item.get("country")) if p)
+    headline = re.sub(r"\s{2,}", " | ", (item.get("headline") or "").strip()) or None
+    fields.update({
+        "full_name": _text(item.get("full_name")),
+        "headline": headline,
+        "current_company": fields.get("current_company") or _text(item.get("company_name")),
+        "location": place or fields.get("location"),
+        "job_location": fields.get("job_location"),
+        "source": "apify",
+    })
+    fields["verification_status"] = "verified" if fields["current_company"] else "needs_review"
+    fields["error_message"] = None if fields["current_company"] else "No current company in public data"
     return fields
 
 

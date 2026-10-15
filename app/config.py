@@ -34,6 +34,11 @@ REQUEST_DELAY_SECONDS = get_int("REQUEST_DELAY_SECONDS", 2)
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip().strip("'\"")
 SERPER_URL = os.getenv("SERPER_URL", "https://google.serper.dev/search")
 
+# Apify actor 'anchor/linkedin-profile-enrichment' (~$6 / 1000 profiles, no LinkedIn login).
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip().strip("'\"")
+APIFY_ACTOR = os.getenv("APIFY_ACTOR", "anchor~linkedin-profile-enrichment")
+APIFY_BATCH_SIZE = get_int("APIFY_BATCH_SIZE", 25)
+
 # SocialCrawl: full experience history with dates (5 credits per profile).
 SOCIALCRAWL_API_KEY = os.getenv("SOCIALCRAWL_API_KEY", "").strip().strip("'\"")
 SOCIALCRAWL_URL = os.getenv("SOCIALCRAWL_URL", "https://www.socialcrawl.dev/v1/linkedin/profile/experiences")
