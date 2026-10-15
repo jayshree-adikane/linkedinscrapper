@@ -33,6 +33,10 @@ REQUEST_DELAY_SECONDS = get_int("REQUEST_DELAY_SECONDS", 2)
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip().strip("'\"")
 SERPER_URL = os.getenv("SERPER_URL", "https://google.serper.dev/search")
+
+# SocialCrawl: full experience history with dates (5 credits per profile).
+SOCIALCRAWL_API_KEY = os.getenv("SOCIALCRAWL_API_KEY", "").strip().strip("'\"")
+SOCIALCRAWL_URL = os.getenv("SOCIALCRAWL_URL", "https://www.socialcrawl.dev/v1/linkedin/profile/experiences")
 # chocodata_then_serper | serper_only | chocodata_only
 PROVIDER_MODE = os.getenv("PROVIDER_MODE", "chocodata_then_serper")
 

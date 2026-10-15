@@ -163,24 +163,152 @@ def fetch_raw(url):
     raise ProviderError(f"Provider error {code}: {body}", retryable=False, status="failed")
 
 
-def _from_chocodata(data, record):
-    experience = data.get("experience") or []
-    current = experience[0] if experience else {}
-    previous = experience[1] if len(experience) > 1 else {}
-    current_company = data.get("current_company") or current.get("company")
+# --------------------------------------------------------------------------
+# Experience parsing. Handles flat entries and LinkedIn's grouped form:
+#   LTM · 1 yr 6 mos
+#     Cloud & Infrastructure Management · Full-time
+#     May 2025 - Present · 1 yr 6 mos
+#     Bengaluru, Karnataka, India · Hybrid
+# --------------------------------------------------------------------------
+_TITLE_KEYS = ("title", "position", "job_title", "role")
+_COMPANY_KEYS = ("company", "company_name", "companyName", "organization", "org")
+_LOCATION_KEYS = ("location", "job_location", "locality", "geo")
+_EMP_TYPE_KEYS = ("employment_type", "employmentType", "job_type", "type")
+_WORK_MODE_KEYS = ("work_mode", "workplace_type", "location_type", "workplaceType", "work_type")
+_ROLE_LIST_KEYS = ("positions", "roles", "sub_positions", "subPositions", "titles")
+_EMP_TYPES = ["Full-time", "Part-time", "Self-employed", "Freelance", "Contract",
+              "Internship", "Apprenticeship", "Seasonal", "Trainee"]
+_WORK_MODES = {"hybrid": "Hybrid", "remote": "Remote", "on-site": "On-site", "onsite": "On-site"}
+
+
+def _text(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = _first(value, ("name", "title", "text", "value"))
+    value = str(value).strip() if value is not None else ""
+    if value.count("*") >= 3 and value.count("*") >= len(value.replace(" ", "")) / 2:
+        return None  # masked text from the logged-out profile view: '******* **** ****'
+    return value or None
+
+
+def _flatten_experience(experience):
+    """One row per role; grouped company entries pass their company down."""
+    rows = []
+    for exp in experience or []:
+        if not isinstance(exp, dict):
+            continue
+        roles = _first(exp, _ROLE_LIST_KEYS)
+        if isinstance(roles, list) and roles:
+            for role in roles:
+                if not isinstance(role, dict):
+                    continue
+                row = dict(role)
+                row["_company"] = _text(_first(exp, _COMPANY_KEYS)) or _text(exp.get("name"))
+                row["_company_duration"] = _text(_first(exp, ("duration", "total_duration")))
+                if not _first(row, _LOCATION_KEYS):
+                    row["location"] = exp.get("location")
+                rows.append(row)
+        else:
+            rows.append(exp)
+    return rows
+
+
+def _is_current(exp):
+    if exp.get("is_current") or exp.get("current"):
+        return True
+    raw = _first(exp, _DATE_RANGE_KEYS)
+    if isinstance(raw, str) and re.search(r"present|current|now", raw, re.I):
+        return True
+    if isinstance(raw, dict):  # {"start": "Sep 2025", "end": "Present"}
+        end = _first(raw, _END_KEYS)
+        return bool(_first(raw, _START_KEYS)) and (
+            not end or bool(re.search(r"present|current|now", str(end), re.I)))
+    end = _first(exp, _END_KEYS)
+    if isinstance(end, str) and re.search(r"present|current|now", end, re.I):
+        return True
+    return bool(_first(exp, _START_KEYS)) and not end and not isinstance(raw, str)
+
+
+def _split_dot(value):
+    return [p.strip() for p in re.split(r"\s*[·•|]\s*", value or "") if p.strip()]
+
+
+def _role_details(exp):
+    """Pull title / company / type / dates / location / work mode from one role."""
+    title = _text(_first(exp, _TITLE_KEYS))
+    company = exp.get("_company") or _text(_first(exp, _COMPANY_KEYS))
+    emp_type = _text(_first(exp, _EMP_TYPE_KEYS))
+    work_mode = _text(_first(exp, _WORK_MODE_KEYS))
+    location = _text(_first(exp, _LOCATION_KEYS))
+
+    # 'LTM · Full-time' / 'Bengaluru, Karnataka, India · Hybrid'
+    if company and "·" in company:
+        parts = _split_dot(company)
+        company = parts[0]
+        for p in parts[1:]:
+            emp_type = emp_type or next((t for t in _EMP_TYPES if t.lower() == p.lower()), None)
+    if title and "·" in title:
+        parts = _split_dot(title)
+        title = parts[0]
+        for p in parts[1:]:
+            emp_type = emp_type or next((t for t in _EMP_TYPES if t.lower() == p.lower()), None)
+    if location:
+        kept = []
+        for p in _split_dot(location):
+            mode = _WORK_MODES.get(p.lower())
+            if mode:
+                work_mode = work_mode or mode
+            else:
+                kept.append(p)
+        location = ", ".join(kept) or None
+    if work_mode:
+        work_mode = _WORK_MODES.get(work_mode.lower().replace("_", "-"), work_mode)
+    if emp_type:
+        emp_type = next((t for t in _EMP_TYPES
+                         if t.lower().replace("-", "") == emp_type.lower().replace("-", "").replace("_", "")),
+                        emp_type)
+
+    dates_full = employment_dates(exp)          # 'May 2025 - Present · 1 yr 6 mos'
+    dates, duration = dates_full, None
+    if dates_full and "·" in dates_full:
+        dates, duration = [p.strip() for p in dates_full.split("·", 1)]
     return {
-        "full_name": data.get("name"),
-        "headline": data.get("headline"),
+        "title": title, "company": company, "employment_type": emp_type,
+        "dates_full": dates_full, "dates": dates, "duration": duration,
+        "company_duration": exp.get("_company_duration"),
+        "location": location, "work_mode": work_mode,
+    }
+
+
+def _from_chocodata(data, record):
+    roles = _flatten_experience(data.get("experience") or data.get("experiences") or [])
+    current_idx = next((i for i, r in enumerate(roles) if _is_current(r)), 0 if roles else None)
+    current = _role_details(roles[current_idx]) if current_idx is not None else {}
+    previous_raw = next((r for i, r in enumerate(roles) if i != current_idx), None)
+    previous = _role_details(previous_raw) if previous_raw else {}
+    current_company = current.get("company") or _text(data.get("current_company"))
+    profile_location = _text(data.get("location"))
+    return {
+        "full_name": _text(data.get("name") or data.get("full_name")),
+        "headline": _text(data.get("headline")),
         "current_job_title": current.get("title"),
         "current_company": current_company,
-        "employment_start_date": employment_dates(current),
+        "employment_type": current.get("employment_type"),
+        "employment_start_date": current.get("dates_full"),
+        "employment_dates": current.get("dates"),
+        "employment_duration": current.get("duration"),
+        "company_duration": current.get("company_duration"),
+        "job_location": current.get("location"),
+        "work_mode": current.get("work_mode"),
         "previous_job_title": previous.get("title"),
         "previous_company": previous.get("company"),
-        "industry": None,
-        "location": data.get("location") or record.get("location"),
+        "industry": _text(data.get("industry")),
+        "location": profile_location or current.get("location") or record.get("location"),
+        "raw_experience": (data.get("experience") or data.get("experiences") or [])[:3],
         "source": "chocodata",
         "verification_status": "verified" if current_company else "needs_review",
-        "error_message": None,
+        "error_message": None if current_company else "No current company in provider data",
     }
 
 
@@ -217,33 +345,50 @@ def serper_search(query, num=5):
     raise ProviderError(f"Serper error {code}: {body}", retryable=False)
 
 
+def _snippet_company(snippet):
+    """'... Engineer at LTM. ...' / 'Experience: LTM · ...' -> 'LTM'"""
+    snip = snippet or ""
+    m = re.search(r"Experience:\s*([^·|]+)", snip)
+    if m:
+        return m.group(1).strip(" .")
+    m = re.search(r"\b(?:at|@|with|joined)\s+([A-Z][\w&.'()\- ]{1,50}?)\s*(?:[.,;·|!]|\s-\s|\s(?:as|in|for|where|and|since|from)\s|$)", snip)
+    if m:
+        return m.group(1).strip(" .")
+    return None
+
+
 def parse_linkedin_result(title, snippet):
     """Best-effort parse of a Google result for a LinkedIn profile.
-    Title forms: 'Name - Title - Company | LinkedIn', 'Name - Title at Company | LinkedIn'.
-    Snippet often has 'Experience: Company · Education: ... · Location: ...'."""
+    Title forms: 'Name - Company', 'Name - Title at Company', or 'Name - <headline>'
+    (a headline may itself contain ' - ', e.g. 'Engineer - Cloud & Infra Management',
+    so a trailing part is only taken as the company when the snippet backs it up)."""
     out = {"full_name": None, "headline": None, "current_job_title": None,
            "current_company": None, "location": None}
     t = re.sub(r"\s*[|\-–]\s*LinkedIn\s*$", "", title or "", flags=re.I).strip()
     parts = [p.strip() for p in re.split(r"\s[-–]\s", t) if p.strip()]
+    snip = snippet or ""
+    snip_company = _snippet_company(snip)
     if parts:
         out["full_name"] = parts[0]
         rest = parts[1:]
-        if len(rest) >= 2:
-            out["current_job_title"], out["current_company"] = rest[0], rest[1]
+        if rest:
             out["headline"] = " - ".join(rest)
-        elif len(rest) == 1:
-            out["headline"] = rest[0]
-            m = re.match(r"(.+?)\s+(?:at|@)\s+(.+)$", rest[0], flags=re.I)
+            m = re.match(r"(.+?)\s+(?:at|@)\s+(.+)$", out["headline"], flags=re.I)
             if m:
                 out["current_job_title"], out["current_company"] = m.group(1).strip(), m.group(2).strip()
-
-    snip = snippet or ""
-    m = re.search(r"Experience:\s*([^·|]+)", snip)
-    if m and not out["current_company"]:
-        out["current_company"] = m.group(1).strip()
+            elif len(rest) >= 2 and snip_company and snip_company.casefold() == rest[-1].casefold():
+                out["current_job_title"], out["current_company"] = " - ".join(rest[:-1]), rest[-1]
+            else:
+                out["current_job_title"] = out["headline"]
+    if not out["current_company"] and snip_company:
+        out["current_company"] = snip_company
+    if (out["current_job_title"] and out["current_company"]
+            and out["current_job_title"].casefold() == out["current_company"].casefold()):
+        out["current_job_title"] = None  # 'Name - Company' form: no title given
     m = re.search(r"Location:\s*([^·|]+)", snip)
     if m:
-        out["location"] = m.group(1).strip()
+        # 'Hyderabad. View Riju KP's profile on LinkedIn...' -> 'Hyderabad'
+        out["location"] = re.split(r"\.\s+View\b|\s+View\s+\S+'s\s+profile", m.group(1))[0].strip(" .")
     return out
 
 
@@ -278,28 +423,120 @@ def lookup_serper(record):
 
 
 # --------------------------------------------------------------------------
+# SocialCrawl: experience items with title, company, employment_type,
+# location ('Bengaluru · Hybrid') and date {start, end}. 5 credits per call.
+# --------------------------------------------------------------------------
+def lookup_socialcrawl(record):
+    if not config.SOCIALCRAWL_API_KEY:
+        raise ProviderError("SOCIALCRAWL_API_KEY is not set", retryable=False, status="restricted")
+    url = record.get("linkedin_url")
+    username_from_url(url)  # validates the URL
+    try:
+        resp = requests.get(config.SOCIALCRAWL_URL, headers={"x-api-key": config.SOCIALCRAWL_API_KEY},
+                            params={"url": url}, timeout=max(config.REQUEST_TIMEOUT_SECONDS, 60))
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise ProviderError(f"SocialCrawl network error: {exc}", retryable=True)
+    code = resp.status_code
+    body = resp.text[:300]
+    if code == 429:
+        raise ProviderError(f"SocialCrawl rate limit (429): {body}", retryable=True)
+    if code in (401, 402, 403):
+        raise ProviderError(f"SocialCrawl auth/credit error {code}: {body}", retryable=False, status="restricted")
+    if code == 404:
+        raise ProviderError(f"SocialCrawl: profile not found: {body}", retryable=False, status="needs_review")
+    if code >= 500:
+        raise ProviderError(f"SocialCrawl server error {code}: {body}", retryable=True)
+    if code != 200:
+        raise ProviderError(f"SocialCrawl error {code}: {body}", retryable=False)
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise ProviderError("SocialCrawl returned invalid JSON", retryable=True)
+    if not payload.get("success", True):
+        raise ProviderError(f"SocialCrawl error: {body}", retryable=False, status="needs_review")
+    items = (payload.get("data") or {}).get("items") or []
+    if not items:
+        raise ProviderError("SocialCrawl: no experience listed on this profile",
+                            retryable=False, status="needs_review")
+    fields = _from_chocodata({"experience": items}, record)
+    for k in ("full_name", "headline"):  # the experiences endpoint has no name/headline
+        fields.pop(k, None)
+    if not fields.get("location"):
+        fields.pop("location", None)
+    fields["source"] = "socialcrawl"
+    fields["credits_remaining"] = payload.get("credits_remaining")
+    return fields
+
+
+# --------------------------------------------------------------------------
 class EmploymentProvider:
-    """PROVIDER_MODE: chocodata_then_serper (default) | serper_only | chocodata_only"""
+    """PROVIDER_MODE: chocodata_then_serper (default) | serper_only | chocodata_only
+
+    In the default mode both sources are combined: ChocoData's public profile
+    card is the most reliable for the current company, Google's result for the
+    title/headline. Fields one source leaves empty are filled from the other."""
+
+    _FILL = ("full_name", "headline", "current_job_title", "current_company", "location")
+
+    def __init__(self, use_socialcrawl=False):
+        self.use_socialcrawl = use_socialcrawl
 
     def lookup(self, record):
+        if self.use_socialcrawl:
+            try:
+                return lookup_socialcrawl(record)
+            except ProviderError as exc:
+                if exc.status == "restricted" or exc.retryable:
+                    raise  # out of credits / bad key / rate limit: stop, don't burn the fallbacks
+                # otherwise (e.g. no experience listed): fall back to the free sources
+        return self._lookup_free(record)
+
+    def _lookup_free(self, record):
         mode = config.PROVIDER_MODE
         if mode == "serper_only":
             return lookup_serper(record)
+
+        choco, choco_exc = None, None
         try:
-            return _from_chocodata(fetch_raw(record.get("linkedin_url")), record)
+            choco = _from_chocodata(fetch_raw(record.get("linkedin_url")), record)
         except ProviderError as exc:
             # Never fall back on auth/quota/config problems: surface them.
             if mode == "chocodata_only" or exc.status == "restricted":
                 raise
-            if not config.SERPER_API_KEY:
+            choco_exc = exc
+        if mode == "chocodata_only":
+            return choco
+        if choco and choco.get("current_job_title") and choco.get("employment_dates"):
+            return choco  # already complete
+        if not config.SERPER_API_KEY:
+            if choco:
+                return choco
+            raise choco_exc
+
+        try:
+            serper = lookup_serper(record)
+        except ProviderError as serper_exc:
+            if serper_exc.status == "restricted":
                 raise
-            try:
-                return lookup_serper(record)
-            except ProviderError as serper_exc:
-                if serper_exc.status == "restricted":
-                    raise
-                raise ProviderError(
-                    f"ChocoData: {exc} | Serper: {serper_exc}",
-                    retryable=exc.retryable or serper_exc.retryable,
-                    status=serper_exc.status if not exc.retryable else exc.status,
-                )
+            if choco:
+                return choco
+            raise ProviderError(
+                f"ChocoData: {choco_exc} | Serper: {serper_exc}",
+                retryable=choco_exc.retryable or serper_exc.retryable,
+                status=serper_exc.status if not choco_exc.retryable else choco_exc.status,
+            )
+        if not choco:
+            return serper
+
+        merged = dict(choco)
+        for k in self._FILL:
+            if not merged.get(k) and serper.get(k):
+                merged[k] = serper[k]
+        title, company = merged.get("current_job_title"), merged.get("current_company")
+        if title and company and title.casefold() == company.casefold():
+            merged["current_job_title"] = None  # Google title was just 'Name - Company'
+        merged["source"] = "chocodata+serper"
+        company = merged.get("current_company")
+        merged["verification_status"] = "verified" if company else "needs_review"
+        merged["error_message"] = None if company else "No current company in public data"
+        return merged
